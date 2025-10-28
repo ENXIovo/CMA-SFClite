@@ -2,6 +2,7 @@
 
 # 结果文件目录（包含实验输出）
 results/
+*.json
 
 # Python 相关
 __pycache__/
