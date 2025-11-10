@@ -22,6 +22,11 @@ from sae_lens import SAE
 from transformer_lens import HookedTransformer
 from tqdm import tqdm
 
+try:
+    from prompt_sets import get_prompt_examples
+except ModuleNotFoundError:
+    from experiments.prompt_sets import get_prompt_examples
+
 
 SAE_MODE = "attn"
 
@@ -126,6 +131,54 @@ def find_mediator_submodule(mediator: Dict, stash: DictionaryStash) -> Tuple[Opt
     if layer_idx < len(stash.resids):
         return stash.resids[layer_idx], mediator_type
     return None, mediator_type
+
+
+def load_ranked_mediators_from_csv(csv_path: str, limit: Optional[int]) -> List[Dict]:
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Top-K 结果文件不存在: {csv_path}")
+
+    def _filtered_lines(path: str):
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                yield line
+
+    filtered_iter = _filtered_lines(csv_path)
+    try:
+        header_line = next(filtered_iter)
+    except StopIteration:
+        raise ValueError(f"Top-K CSV ({csv_path}) 内没有有效内容")
+
+    header_raw = next(csv.reader([header_line]))
+    header = [col.strip() for col in header_raw]
+    required = {"rank", "layer", "head"}
+    missing = required - set(header)
+    if missing:
+        raise ValueError(f"Top-K CSV 缺少必要列: {', '.join(sorted(missing))}")
+
+    reader = csv.DictReader(filtered_iter, fieldnames=header)
+    mediators: List[Dict] = []
+    for row in reader:
+        if not row:
+            continue
+        row = {key: (value.strip() if isinstance(value, str) else value) for key, value in row.items()}
+        if row.get("rank") in (None, ""):
+            continue
+        mediator = {
+            "rank": int(row["rank"]),
+            "layer": int(row["layer"]),
+            "head": int(row["head"]),
+            "nie": float(row["nie"]) if row.get("nie") not in (None, "") else None,
+            "abs_nie": float(row["abs_nie"]) if row.get("abs_nie") not in (None, "") else None,
+            "type": "attn",
+        }
+        mediators.append(mediator)
+
+    if limit is not None and limit > 0:
+        mediators = mediators[:limit]
+    return mediators
 
 
 def tokenize_prompt(model: HookedTransformer, prompt: str) -> torch.Tensor:
@@ -413,7 +466,8 @@ def apply_alpha_gate(
     bias_clean, ppl_clean = compute_bias_and_ppl(model, logits_clean, tokens_base)
     bias_gated, ppl_gated = compute_bias_and_ppl(model, logits_gated, tokens_base)
     bias_cf_replaced, _ = compute_bias_and_ppl(model, logits_cf, tokens_base)
-    nie = bias_cf_replaced - bias_gated
+    # 与 baselines 对齐：NIE = bias_cf_replaced - bias_clean
+    nie = bias_cf_replaced - bias_clean
     return bias_clean, bias_gated, ppl_clean, ppl_gated, nie
 
 
@@ -480,9 +534,9 @@ def compute_feature_effect(
 
 def run_local_gate(
     model_name: str,
-    mediator_path: str,
-    eval_path: str,
+    ranking_csv_path: str,
     output_path: str,
+    prompt_split: str,
     topk: int,
     control_count: int,
     num_features: int,
@@ -496,8 +550,8 @@ def run_local_gate(
     print("NIE Local Gate")
     print("=" * 70)
     print(f"模型: {model_name}")
-    print(f"Top-K 文件: {mediator_path}")
-    print(f"评估数据: {eval_path}")
+    print(f"Top-K CSV: {ranking_csv_path}")
+    print(f"Prompt split: {prompt_split}")
     print(f"SAE 模式: {SAE_MODE}")
     print("α 列表:", alphas)
     print("=" * 70)
@@ -515,18 +569,14 @@ def run_local_gate(
 
     stash, dictionaries = load_saes_and_submodules(model, device=device)
 
-    with open(mediator_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    mediators = data if isinstance(data, list) else data.get("mediators", [])
-    mediators = mediators[: topk + control_count]
+    total_needed = topk + control_count
+    mediators = load_ranked_mediators_from_csv(ranking_csv_path, total_needed if total_needed > 0 else None)
     entries = [(med, "topk") for med in mediators[:topk]]
     entries.extend((med, "control") for med in mediators[topk: topk + control_count])
 
-    with open(eval_path, "r", encoding="utf-8") as f:
-        eval_data = json.load(f)
-    examples = eval_data.get("examples", eval_data if isinstance(eval_data, list) else [])
+    examples = get_prompt_examples(prompt_split)
     if not examples:
-        raise ValueError("评估数据为空")
+        raise ValueError(f"Prompt split '{prompt_split}' 没有可用样本")
 
     rng = np.random.default_rng(seed)
     corpus_tokens = tokenize_corpus(model, corpus_path, max_corpus_tokens=max_corpus_tokens)
@@ -619,7 +669,8 @@ def run_local_gate(
                         )
                         bias_edit_vals.append(bias_edit)
                         ppl_edit_vals.append(ppl_edit)
-                        delta_nie_vals.append(nie_after - entry["nie"])
+                        # 与 baselines 对齐：Δ|NIE| = |NIE_after| - |NIE_before|
+                        delta_nie_vals.append(abs(nie_after) - abs(entry["nie"]))
 
                     if not bias_edit_vals:
                         continue
@@ -781,16 +832,16 @@ def plot_pareto_curves(pareto_data: Dict[str, List[Dict]], csv_path: str, title:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="NIE Local Gate")
     parser.add_argument("--model", type=str, default="gpt2")
-    parser.add_argument("--topk_json", type=str, default="/Users/qjzheng/Desktop/CMA-SFC-integration/experiments/data/topk_mediators_gpt2-small_doctor_woman_20251026_150239.json")
-    parser.add_argument("--eval_data", type=str, default="/Users/qjzheng/Desktop/CMA-SFC-integration/experiments/data/bias_eval_gpt2-small_doctor_woman_20251026_150239.json")
+    parser.add_argument("--ranking_csv", type=str, default="results/gpt2-small_nurse_man_20251109_173606.csv")
     parser.add_argument("--output", type=str, default="results/nie_local_gate.csv")
+    parser.add_argument("--prompt_split", type=str, default="test", choices=["train", "val", "test", "all"])
     parser.add_argument("--topk", type=int, default=3)
-    parser.add_argument("--controls", type=int, default=0)
+    parser.add_argument("--controls", type=int, default=2)
     parser.add_argument("--num_features", type=int, default=5)
     parser.add_argument("--alphas", type=float, nargs="+", default=[1.0, 0.75, 0.5, 0.25, 0.0])
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--corpus_path", type=str, default="test.txt", help="用于 ΔPPL 的语料文件")
+    parser.add_argument("--corpus_path", type=str, default="data/WikiText‑2.txt", help="用于 ΔPPL 的语料文件")
     parser.add_argument("--max_corpus_tokens", type=int, default=4096, help="语料最大 token 数")
     return parser.parse_args()
 
@@ -799,9 +850,9 @@ def main() -> None:
     args = parse_args()
     run_local_gate(
         model_name=args.model,
-        mediator_path=args.topk_json,
-        eval_path=args.eval_data,
+        ranking_csv_path=args.ranking_csv,
         output_path=args.output,
+        prompt_split=args.prompt_split,
         topk=args.topk,
         control_count=args.controls,
         num_features=args.num_features,

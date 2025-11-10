@@ -509,8 +509,94 @@ def apply_alpha_gate(
     bias_clean, ppl_clean = compute_bias_and_ppl(model, logits_clean, tokens_base)
     bias_gated, ppl_gated = compute_bias_and_ppl(model, logits_gated, tokens_base)
     bias_cf_replaced, _ = compute_bias_and_ppl(model, logits_cf, tokens_base)
-    nie = bias_cf_replaced - bias_gated
+    nie = bias_cf_replaced - bias_clean
     return bias_clean, bias_gated, ppl_clean, ppl_gated, nie
+
+
+# 新增：基于 head 的 TL hook_z 单头替换，按 cmagenderbias 的语义计算 NIE
+def apply_head_patch(
+    model: HookedTransformer,
+    layer_idx: int,
+    head_idx: int,
+    base_prompt: str,
+    cf_prompt: str,
+) -> Tuple[float, float, float, float, float]:
+    tokens_base = tokenize_prompt(model, base_prompt)[0]
+    tokens_base_batched = tokenize_prompt(model, base_prompt)
+    tokens_cf = tokenize_prompt(model, cf_prompt)
+
+    with torch.no_grad():
+        logits_clean = model(tokens_base_batched, return_type="logits")
+
+    with torch.no_grad():
+        _, cache_cf = model.run_with_cache(tokens_cf, remove_batch_dim=False)
+    z_cf_all = cache_cf[f"blocks.{layer_idx}.attn.hook_z"]  # [1, seq, H, d_head]
+    z_cf_head = z_cf_all[0, -1, head_idx, :].detach().clone()
+
+    def patch_z(value: torch.Tensor, hook):
+        out = value.clone()
+        out[0, -1, head_idx, :] = z_cf_head
+        return out
+
+    with torch.no_grad():
+        logits_int = model.run_with_hooks(
+            tokens_base_batched,
+            fwd_hooks=[(f"blocks.{layer_idx}.attn.hook_z", patch_z)],
+            return_type="logits",
+        )
+
+    bias_clean, ppl_clean = compute_bias_and_ppl(model, logits_clean, tokens_base)
+    bias_int, ppl_int = compute_bias_and_ppl(model, logits_int, tokens_base)
+    nie = bias_int - bias_clean
+    return bias_clean, bias_int, ppl_clean, ppl_int, nie
+
+
+def apply_head_random_patch(
+    model: HookedTransformer,
+    layer_idx: int,
+    head_idx: int,
+    base_prompt: str,
+    cf_prompt: str,
+    dims_idx: Optional[List[int]],
+    alpha: float,
+) -> Tuple[float, float, float, float, float]:
+    """
+    仅对选中头（layer_idx, head_idx）的 hook_z 在最后一个位置进行“cf→base 替换”，
+    且只对给定的维度索引 dims_idx 应用缩放 alpha（例如 alpha=0 置零这些维度），
+    计算 NIE = bias_int - bias_clean。
+    """
+    tokens_base = tokenize_prompt(model, base_prompt)[0]
+    tokens_base_batched = tokenize_prompt(model, base_prompt)
+    tokens_cf = tokenize_prompt(model, cf_prompt)
+
+    with torch.no_grad():
+        logits_clean = model(tokens_base_batched, return_type="logits")
+
+    with torch.no_grad():
+        _, cache_cf = model.run_with_cache(tokens_cf, remove_batch_dim=False)
+    z_cf_all = cache_cf[f"blocks.{layer_idx}.attn.hook_z"]  # [1, seq, H, d_head]
+    z_cf_head = z_cf_all[0, -1, head_idx, :].detach().clone()
+
+    def patch_z(value: torch.Tensor, hook):
+        out = value.clone()
+        # 先用 cf 的该头替换
+        out[0, -1, head_idx, :] = z_cf_head
+        # 再对选中的维度做缩放（例如置零）
+        if dims_idx is not None and len(dims_idx) > 0:
+            out[0, -1, head_idx, dims_idx] = out[0, -1, head_idx, dims_idx] * alpha
+        return out
+
+    with torch.no_grad():
+        logits_int = model.run_with_hooks(
+            tokens_base_batched,
+            fwd_hooks=[(f"blocks.{layer_idx}.attn.hook_z", patch_z)],
+            return_type="logits",
+        )
+
+    bias_clean, ppl_clean = compute_bias_and_ppl(model, logits_clean, tokens_base)
+    bias_int, ppl_int = compute_bias_and_ppl(model, logits_int, tokens_base)
+    nie = bias_int - bias_clean
+    return bias_clean, bias_int, ppl_clean, ppl_int, nie
 
 
 # ============================================================================
@@ -524,7 +610,6 @@ def run_baselines(
     output_path: str,
     prompt_split: str,
     topk: int,
-    control_count: int,
     num_features: int,
     seed: int,
     device: str,
@@ -541,7 +626,7 @@ def run_baselines(
     print(f"Top-K Mediators CSV: {ranking_csv_path}")
     print(f"评估 prompts split: {prompt_split}")
     print(f"SAE 模式: {SAE_MODE}")
-    print(f"Top-K: {topk}, 控制数量: {control_count}")
+    print(f"Top-K: {topk}")
     print("=" * 70)
 
     dtype = torch.float32
@@ -557,13 +642,9 @@ def run_baselines(
 
     stash, dictionaries = load_saes_and_submodules(model, device=device)
 
-    total_needed = topk + control_count
-    mediators = load_ranked_mediators_from_csv(ranking_csv_path, total_needed if total_needed > 0 else None)
+    mediators = load_ranked_mediators_from_csv(ranking_csv_path, topk if topk > 0 else None)
     mediators_main = mediators[:topk]
-    mediators_control = mediators[topk:topk + control_count]
-
     mediator_entries = [(mediator, "topk") for mediator in mediators_main]
-    mediator_entries.extend((mediator, "control") for mediator in mediators_control)
 
     examples = get_prompt_examples(prompt_split)
     if not examples:
@@ -591,9 +672,31 @@ def run_baselines(
                 "feature_indices": None,
                 "alpha": 0.0,
                 "num_features": 1,
-                "feature_source": "cma" if category == "topk" else category,
+                "feature_source": "cma",
             }
         ]
+
+        # 新增：针对有 head 信息的中介器，增加单头替换与随机维度剪切场景（与 cmagenderbias 对齐）
+        mediator_head = mediator.get("head", None)
+        if mediator_head is not None:
+            scenarios.append({
+                "label": "cma_head",
+                "feature_indices": None,
+                "alpha": None,
+                "num_features": 1,
+                "feature_source": "cma",
+            })
+            # 为随机头剪切准备随机维度（基于 d_head）
+            d_head = int(getattr(model.cfg, "d_head", model.cfg.d_model // model.cfg.n_heads))
+            head_dims_count = min(num_features, d_head)
+            head_dims_idx = rng.choice(d_head, size=head_dims_count, replace=False).tolist() if head_dims_count > 0 else []
+            scenarios.append({
+                "label": "random_head",
+                "feature_indices": head_dims_idx,  # 用于 head 维度索引
+                "alpha": 0.0,
+                "num_features": len(head_dims_idx),
+                "feature_source": "random",
+            })
 
         if dict_size > 0:
             rand_features = rng.choice(dict_size, size=min(num_features, dict_size), replace=False).tolist()
@@ -618,33 +721,76 @@ def run_baselines(
                 if not base_prompt or not cf_prompt:
                     continue
 
-                bias_base_orig, _, ppl_base_orig, _, nie_orig = apply_alpha_gate(
-                    model=model,
-                    mediator=mediator,
-                    submodule=submodule,
-                    dictionary=dictionary,
-                    base_prompt=base_prompt,
-                    cf_prompt=cf_prompt,
-                    feature_indices=None,
-                    alpha=1.0,
-                )
+                if scenario["label"] == "cma_head" and mediator_head is not None:
+                    # 头级别干预：直接计算 NIE = bias_int - bias_clean（无“前后差”）
+                    bias_clean, bias_int, ppl_clean, ppl_int, nie_head = apply_head_patch(
+                        model=model,
+                        layer_idx=mediator["layer"],
+                        head_idx=mediator_head,
+                        base_prompt=base_prompt,
+                        cf_prompt=cf_prompt,
+                    )
+                    bias_clean_vals.append(bias_clean)
+                    bias_edit_vals.append(bias_int)
+                    ppl_clean_vals.append(ppl_clean)
+                    ppl_edit_vals.append(ppl_int)
+                    # Δ|NIE|：与“完整头替换”的基线相同，差值为 0
+                    nie_vals.append(0.0)
+                elif scenario["label"] == "random_head" and mediator_head is not None:
+                    # 头级别随机剪切：只在替换分支对选中维度缩放/置零
+                    # 先计算“完整头替换”的基线 NIE
+                    _, _, _, _, nie_head_full = apply_head_patch(
+                        model=model,
+                        layer_idx=mediator["layer"],
+                        head_idx=mediator_head,
+                        base_prompt=base_prompt,
+                        cf_prompt=cf_prompt,
+                    )
+                    bias_clean, bias_int, ppl_clean, ppl_int, nie_head_rand = apply_head_random_patch(
+                        model=model,
+                        layer_idx=mediator["layer"],
+                        head_idx=mediator_head,
+                        base_prompt=base_prompt,
+                        cf_prompt=cf_prompt,
+                        dims_idx=scenario["feature_indices"],
+                        alpha=scenario["alpha"],
+                    )
+                    bias_clean_vals.append(bias_clean)
+                    bias_edit_vals.append(bias_int)
+                    ppl_clean_vals.append(ppl_clean)
+                    ppl_edit_vals.append(ppl_int)
+                    # Δ|NIE| = |NIE_after| - |NIE_before|
+                    nie_vals.append(abs(nie_head_rand) - abs(nie_head_full))
+                else:
+                    # SAE-特征路径：先得到“完整替换”的原始 NIE，再得到门控后的 NIE，做差
+                    bias_base_orig, _, ppl_base_orig, _, nie_orig = apply_alpha_gate(
+                        model=model,
+                        mediator=mediator,
+                        submodule=submodule,
+                        dictionary=dictionary,
+                        base_prompt=base_prompt,
+                        cf_prompt=cf_prompt,
+                        feature_indices=None,
+                        alpha=1.0,
+                    )
 
-                _, bias_base_gated, _, ppl_base_gated, nie_after = apply_alpha_gate(
-                    model=model,
-                    mediator=mediator,
-                    submodule=submodule,
-                    dictionary=dictionary,
-                    base_prompt=base_prompt,
-                    cf_prompt=cf_prompt,
-                    feature_indices=scenario["feature_indices"],
-                    alpha=scenario["alpha"],
-                )
+                    _, bias_base_gated, _, ppl_base_gated, nie_after = apply_alpha_gate(
+                        model=model,
+                        mediator=mediator,
+                        submodule=submodule,
+                        dictionary=dictionary,
+                        base_prompt=base_prompt,
+                        cf_prompt=cf_prompt,
+                        feature_indices=scenario["feature_indices"],
+                        alpha=scenario["alpha"],
+                    )
 
-                bias_clean_vals.append(bias_base_orig)
-                bias_edit_vals.append(bias_base_gated)
-                ppl_clean_vals.append(ppl_base_orig)
-                ppl_edit_vals.append(ppl_base_gated)
-                nie_vals.append(nie_after - nie_orig)
+                    bias_clean_vals.append(bias_base_orig)
+                    bias_edit_vals.append(bias_base_gated)
+                    ppl_clean_vals.append(ppl_base_orig)
+                    ppl_edit_vals.append(ppl_base_gated)
+                    # Δ|NIE| = |NIE_after| - |NIE_before|
+                    nie_vals.append(abs(nie_after) - abs(nie_orig))
 
             if has_examples and not bias_clean_vals:
                 print(f"  ⚠ Mediator {idx} - {scenario['label']} 没有有效样本，跳过")
@@ -672,7 +818,7 @@ def run_baselines(
 
             gated_corpus_ppl = float("nan")
             delta_corpus_ppl = float("nan")
-            if corpus_tokens is not None:
+            if corpus_tokens is not None and scenario["label"] not in ("cma_head", "random_head"):
                 hook_fn = make_scaling_hook(dictionary, scenario["feature_indices"], scenario["alpha"])
                 gated_corpus_ppl = compute_corpus_perplexity(
                     model,
@@ -692,7 +838,19 @@ def run_baselines(
                 "feature_source": scenario["feature_source"],
                 "feature_count": scenario["num_features"],
                 "alpha": scenario["alpha"],
-                "sum_abs_edit": abs(1.0 - scenario["alpha"]) * max(1, scenario["num_features"]),
+                # 成本度量：按场景安全计算，避免 alpha=None 报错
+                # - SAE 剪枝：|1-α| × #features
+                # - cma_head：替换整个 head，近似用 d_head 作为成本
+                # - random_head：|1-α| × #dims_in_head
+                "sum_abs_edit": (
+                    float(getattr(model.cfg, "d_head", model.cfg.d_model // model.cfg.n_heads))
+                    if scenario["label"] == "cma_head"
+                    else (
+                        abs(1.0 - float(scenario["alpha"])) * float(max(1, scenario.get("num_features", 1)))
+                        if scenario.get("alpha") is not None
+                        else float(max(1, scenario.get("num_features", 1)))
+                    )
+                ),
                 "bias_original_mean": mean_bias_clean,
                 "bias_edited_mean": mean_bias_edit,
                 "ppl_original_mean": mean_ppl_clean,
@@ -707,7 +865,7 @@ def run_baselines(
                 "mediator_type": mediator_type,
                 "mediator_head": mediator.get("head"),
                 "mediator_nie": mediator.get("nie"),
-                "mediator_category": category,
+                "mediator_category": "topk",
                 "row_type": "aggregate",
                 "nie_source": nie_source,
             }
@@ -736,7 +894,6 @@ def plot_baseline_results(rows: List[Dict], csv_path: str) -> None:
 
 FEATURE_SOURCE_MARKERS = {
     "cma": "o",
-    "control": "s",
     "random": "^",
 }
 
@@ -907,8 +1064,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=str, default="results/nie_baselines.csv")
     parser.add_argument("--prompt_split", type=str, default="test", choices=["train", "val", "test", "all"])
     parser.add_argument("--topk", type=int, default=8)
-    parser.add_argument("--controls", type=int, default=3)
-    parser.add_argument("--num_features", type=int, default=10)
+    parser.add_argument("--num_features", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--corpus_path", type=str, default="data/WikiText‑2.txt", help="用于 PPL 评估的语料")
@@ -924,7 +1080,6 @@ def main() -> None:
         output_path=args.output,
         prompt_split=args.prompt_split,
         topk=args.topk,
-        control_count=args.controls,
         num_features=args.num_features,
         seed=args.seed,
         device=args.device,
