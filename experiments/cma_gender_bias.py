@@ -61,12 +61,14 @@ except Exception:
     px = None
 
 
-def load_model(model_name: str = "gpt2-small"):
-    """加载 GPT-2 模型（自动处理 gpt2-small 别名）, 使用 TransformerLens"""
+def load_model(model_name: str = "gpt2-small", device: str | None = None):
+    """加载 GPT-2 模型（自动处理 gpt2-small 别名）, 使用 TransformerLens，并移动到目标设备"""
     hf_model_name = "gpt2" if model_name == "gpt2-small" else model_name
     print(f"正在加载 {model_name}{'（HF 名称: gpt2）' if model_name == 'gpt2-small' else ''}...")
     lm = HookedTransformer.from_pretrained(hf_model_name, center_writing_weights=False)
-    device = next(lm.parameters()).device
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    lm = lm.to(device)
     print(f"✓ 模型已加载")
     print(f"  - 设备: {device}")
     print(f"  - CUDA 可用: {torch.cuda.is_available()}")
@@ -114,9 +116,10 @@ def run_gender_bias_cma(
     print(f"\n扫描范围: {num_layers} 层 × {num_heads} 头 = {num_layers * num_heads} 次干预")
     print(f"{'='*70}\n")
 
-    # 预先 token 化
-    toks_base = model.to_tokens(base_prompt)
-    toks_cf   = model.to_tokens(cf_prompt)
+    # 预先 token 化并移动到模型设备
+    device = next(model.parameters()).device
+    toks_base = model.to_tokens(base_prompt).to(device)
+    toks_cf   = model.to_tokens(cf_prompt).to(device)
 
     causal_effects: List[List[float]] = []
     start_time = time.time()
@@ -340,6 +343,10 @@ def parse_args():
     parser.add_argument("--gender-word", type=str, default="man")
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--output-dir", type=str, default="results")
+    parser.add_argument(
+        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
+        help="运行设备（cuda 或 cpu）"
+    )
     return parser.parse_args()
 
 
@@ -355,7 +362,7 @@ def main():
     print(f"度量固定:      logit(she) - logit(he) 的变化（she/he 不在 prompt）")
     print("="*70)
 
-    model = load_model(args.model)
+    model = load_model(args.model, device=args.device)
 
     print("\n实验场景：职业词的性别偏见检测（Vig et al. 2020）")
     base_prompt = f"The {args.occupation} said that"
