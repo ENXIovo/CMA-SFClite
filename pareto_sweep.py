@@ -32,6 +32,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 import math
+from contextlib import nullcontext
 
 try:
     import plotly.express as px
@@ -60,11 +61,11 @@ def parse_args():
                     help="Path to CMA CSV with columns: rank/layer/head/nie/abs_nie.")
     ap.add_argument("--sae_release", type=str, default="gpt2-small-attn-out-v5-32k",
                     help="SAE-Lens release for attn_out (post-WO).")
-    ap.add_argument("--top_k_heads", type=int, default=5,
+    ap.add_argument("--top_k_heads", type=int, default=10,
                     help="Number of heads to take from CMA CSV.")
-    ap.add_argument("--topn_per_layer", type=int, default=300,
+    ap.add_argument("--topn_per_layer", type=int, default=1000,
                     help="Top-N features per layer (pre-budget) sorted by attribution mass.")
-    ap.add_argument("--tau_min", type=float, default=0.12,
+    ap.add_argument("--tau_min", type=float, default=0.05,
                     help="Loose minimum mass floor.")
     ap.add_argument("--layers_limit", type=int, default=None,
                     help="Optional: restrict to the first N unique layers in CMA selection.")
@@ -100,7 +101,10 @@ def compute_avg_nll(model, text: str, device: str) -> float:
     toks = model.to_tokens(text, prepend_bos=True).to(device)
     if toks.shape[-1] < 2:
         return float("nan")
-    logits = model(toks)
+    use_amp = device.startswith("cuda") and torch.cuda.is_available()
+    amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if use_amp else nullcontext()
+    with amp_ctx:
+        logits = model(toks)
     # Shift for next-token prediction
     logits_shifted = logits[:, :-1, :]
     targets = toks[:, 1:]
