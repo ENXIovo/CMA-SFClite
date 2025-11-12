@@ -37,6 +37,7 @@ from contextlib import nullcontext
 from .prompts_winogender import get_prompt_examples
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+from transformer_lens import HookedTransformer
 
 try:
     import plotly.express as px
