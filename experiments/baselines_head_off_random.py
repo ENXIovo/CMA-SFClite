@@ -877,6 +877,11 @@ def run_baselines(
     print(f"Top-K: {topk}")
     print("=" * 70)
 
+    # 将输出文件名加上 topk 标识
+    base_out, ext_out = os.path.splitext(output_path)
+    if f"_topk{topk}" not in base_out:
+        output_path = f"{base_out}_topk{topk}{ext_out}"
+
     dtype = torch.float32
     model = HookedTransformer.from_pretrained(
         model_name,
@@ -1101,9 +1106,10 @@ def plot_bias_vs_ppl(rows: List[Dict], csv_path: str) -> None:
     if not scatter_points:
         return
 
-    costs = [point[2].get("sum_abs_edit", 0.0) for point in scatter_points]
-    cost_min, cost_max = (min(costs), max(costs)) if costs else (0.0, 0.0)
-    norm = Normalize(vmin=cost_min, vmax=cost_max) if cost_max - cost_min > 1e-6 else None
+    # colorbar 使用 num_features
+    nfs = [point[2].get("feature_count", 0.0) for point in scatter_points]
+    nf_min, nf_max = (min(nfs), max(nfs)) if nfs else (0.0, 0.0)
+    norm = Normalize(vmin=nf_min, vmax=nf_max) if nf_max - nf_min > 1e-6 else None
     cmap = plt.get_cmap("plasma")
 
     plt.figure(figsize=(8, 5))
@@ -1115,7 +1121,7 @@ def plot_bias_vs_ppl(rows: List[Dict], csv_path: str) -> None:
             continue
         xs = [point[0] for point in subset]
         ys = [point[1] for point in subset]
-        colors = [point[2].get("sum_abs_edit", 0.0) for point in subset]
+        colors = [point[2].get("feature_count", 0.0) for point in subset]
         marker = FEATURE_SOURCE_MARKERS.get(source, "o")
         scatter = plt.scatter(
             xs,
@@ -1126,22 +1132,21 @@ def plot_bias_vs_ppl(rows: List[Dict], csv_path: str) -> None:
             marker=marker,
             alpha=0.85,
             edgecolors="none",
-            label=source,
         )
         scatter_handles.append(scatter)
 
     if scatter_handles:
         cbar = plt.colorbar(scatter_handles[0])
-        cbar.set_label("|1-α| × #features")
+        cbar.set_label("num_features")
 
     pareto_points = build_bias_delta_pareto([(point[0], point[1]) for point in scatter_points])
     if pareto_points:
         px, py = zip(*pareto_points)
-        plt.plot(px, py, color="black", linewidth=2, label="Pareto front")
+        plt.plot(px, py, color="black", linewidth=2)
 
-    plt.xlabel("剩余偏差（% 基线）")
+    plt.xlabel("Remaining bias (% baseline)")
     plt.ylabel("ΔPPL")
-    plt.title("Bias–Perplexity Pareto")
+    plt.title("SAE Multi-layer Random Cut: Bias-Perplexity Pareto")
     handles, labels = plt.gca().get_legend_handles_labels()
     if handles:
         plt.legend(handles, labels)
@@ -1196,7 +1201,6 @@ def plot_nie_vs_ppl(rows: List[Dict], csv_path: str) -> None:
             marker=marker,
             alpha=0.85,
             edgecolors="none",
-            label=source,
         )
         color_ref = color_ref or scatter
 
@@ -1206,7 +1210,7 @@ def plot_nie_vs_ppl(rows: List[Dict], csv_path: str) -> None:
 
     plt.xlabel("Δ|NIE|")
     plt.ylabel("ΔPPL")
-    plt.title("SAE 多层随机剪：Δ|NIE| vs ΔPPL")
+    plt.title("SAE Multi-Layer Random Cut: Δ|NIE| vs ΔPPL")
     handles, labels = plt.gca().get_legend_handles_labels()
     if handles:
         plt.legend(handles, labels)
