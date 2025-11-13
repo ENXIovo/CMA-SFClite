@@ -1294,7 +1294,7 @@ def plot_nie_vs_ppl(rows: List[Dict], csv_path: str) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="NIE Baselines (Head-off, Random Cut)")
     parser.add_argument("--model", type=str, default="gpt2")
-    parser.add_argument("--ranking_csv", type=str, default="results/gpt2-small_nurse_man_20251110_173059.csv")
+    parser.add_argument("--ranking_csv", type=str, default="data/gpt2-small_nurse_man_20251110_173059.csv")
     parser.add_argument("--output", type=str, default="results/nie_baselines.csv")
     parser.add_argument("--prompt_split", type=str, default="test", choices=["train", "val", "test", "all"])
     parser.add_argument("--topk", type=int, default=1)

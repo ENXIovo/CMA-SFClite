@@ -13,7 +13,7 @@ Output:
 
 Usage (example):
   python pareto_sweep.py \
-    --cma_csv results/gpt2-small_nurse_man_20251028_042958.csv \
+    --cma_csv data/gpt2-small_nurse_man_example.csv \
     --budgets 0,100,300,600,1200,2400,4800 \
     --top_k_heads 5 --topn_per_layer 300 --tau_min 0.12 \
     --ppl_file path/to/text.txt \
@@ -62,7 +62,7 @@ from .cma_gender_bias import run_gender_bias_cma
 
 def parse_args():
     ap = argparse.ArgumentParser("Pareto sweep for SFC-lite (budget vs. bias improvement)")
-    ap.add_argument("--cma_csv", type=str, default="results/gpt2-small_nurse_man_20251110_173059.csv",
+    ap.add_argument("--cma_csv", type=str, default="data/gpt2-small_nurse_man_20251110_173059.csv",
                     help="Path to CMA CSV with columns: rank/layer/head/nie/abs_nie.")
     ap.add_argument("--sae_release", type=str, default="gpt2-small-attn-out-v5-32k",
                     help="SAE-Lens release for attn_out (post-WO).")
