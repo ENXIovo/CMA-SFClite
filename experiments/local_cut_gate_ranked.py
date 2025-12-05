@@ -937,10 +937,10 @@ FEATURE_SOURCE_MARKERS = {
 
 
 def _select_delta_ppl(row: Dict) -> float:
-    val = row.get("delta_corpus_ppl")
-    if val is None or (isinstance(val, float) and np.isnan(val)):
-        val = row.get("delta_ppl_mean")
-    return val
+    """
+    统一使用语料级 ΔPPL（基于 WikiText 等 corpus），不再回退到 prompt 级。
+    """
+    return row.get("delta_corpus_ppl")
 
 
 def build_bias_delta_pareto(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
@@ -1027,6 +1027,49 @@ def plot_baseline_results(rows: List[Dict], csv_path: str) -> None:
     plt.close()
     print(f"✓ 绘制 Bias-Pareto 图: {plot_path}")
 
+    # 额外：feature_count vs remaining_bias_pct 简单折线图（不做 Pareto）
+    agg_rows = [r for r in rows if r.get("row_type") == "aggregate"]
+    if agg_rows:
+        alpha_groups: Dict[float, List[Dict]] = {}
+        for r in agg_rows:
+            a = r.get("alpha")
+            if a is None or (isinstance(a, float) and np.isnan(a)):
+                continue
+            alpha_groups.setdefault(float(a), []).append(r)
+
+        if alpha_groups:
+            plt.figure(figsize=(8, 5))
+            cmap_line = plt.get_cmap("viridis")
+            alphas_sorted = sorted(alpha_groups.keys())
+            denom = max(1, len(alphas_sorted) - 1)
+            for idx, a in enumerate(alphas_sorted):
+                group = alpha_groups[a]
+                # 按 feature_count 排序，画出随剪特征数量变化的剩余偏差曲线
+                group_sorted = sorted(
+                    group, key=lambda g: g.get("feature_count", 0)
+                )
+                xs = [g.get("feature_count", 0) for g in group_sorted]
+                ys = [
+                    g.get("remaining_bias_pct", float("nan")) * 100
+                    for g in group_sorted
+                ]
+                plt.plot(
+                    xs,
+                    ys,
+                    marker="o",
+                    label=f"α={a}",
+                    color=cmap_line(idx / denom),
+                )
+            plt.xlabel("feature_count")
+            plt.ylabel("Remaining bias (% baseline)")
+            plt.title("Feature Count vs Remaining Bias (local cut/gate)")
+            plt.grid(True, alpha=0.3)
+            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+            fb_path = os.path.splitext(csv_path)[0] + "_feature_bias.png"
+            plt.savefig(fb_path, dpi=150, bbox_inches="tight")
+            plt.close()
+            print(f"✓ 绘制 Feature-Bias 折线图: {fb_path}")
+
     # Plotly HTML 交互图（可选）
     try:
         import pandas as pd
@@ -1039,15 +1082,12 @@ def plot_baseline_results(rows: List[Dict], csv_path: str) -> None:
         base_path = os.path.splitext(csv_path)[0]
 
         def _y(row: Dict) -> float:
-            val = row.get("delta_corpus_ppl")
-            if val is None or (isinstance(val, float) and (val != val)):
-                val = row.get("delta_ppl_mean")
-            return val
+            # 仅使用语料级 ΔPPL
+            return row.get("delta_corpus_ppl")
 
         df = pd.DataFrame(
             {
-                "delta_nie": [r.get("delta_nie_mean") for r in aggregate_rows],
-                "remaining_nie_pct": [
+                "remaining_bias_pct": [
                     r.get("remaining_bias_pct", float("nan")) * 100 for r in aggregate_rows
                 ],
                 "delta_ppl": [_y(r) for r in aggregate_rows],
@@ -1143,7 +1183,7 @@ def plot_alpha_pareto_lines(rows: List[Dict], csv_path: str) -> None:
     plt.ylabel("ΔPPL")
     plt.title("Alpha-wise Pareto (Remaining Bias vs ΔPPL)")
     plt.grid(True, alpha=0.3)
-    plt.legend()
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     plot_path = os.path.splitext(csv_path)[0] + "_alpha_pareto.png"
     plt.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close()
