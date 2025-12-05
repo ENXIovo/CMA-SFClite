@@ -242,19 +242,32 @@ def make_scaling_hook(
     alpha: float,
 ):
     device = next(dictionary.parameters()).device
-    if feature_indices:
-        feature_tensor = torch.tensor(feature_indices, device=device, dtype=torch.long)
-    else:
+
+    # 语义对齐：
+    # - feature_indices is None → 作用于“全部特征”
+    # - feature_indices == []   → 不作用于任何特征（no-op）
+    # - 否则仅作用于给定索引
+    if feature_indices is None:
+        mode = "all"
         feature_tensor = None
+    elif len(feature_indices) == 0:
+        mode = "none"
+        feature_tensor = None
+    else:
+        mode = "some"
+        feature_tensor = torch.tensor(feature_indices, device=device, dtype=torch.long)
 
     def hook_fn(value: torch.Tensor, hook) -> torch.Tensor:
         features = dictionary.encode(value)
         recon = dictionary.decode(features)
         residual = value - recon
-        if feature_tensor is None:
+        if mode == "all":
             features = features * alpha
-        else:
+        elif mode == "some":
             features[..., feature_tensor] = features[..., feature_tensor] * alpha
+        else:
+            # mode == "none" → 不改动
+            pass
         return dictionary.decode(features) + residual
 
     return hook_fn
