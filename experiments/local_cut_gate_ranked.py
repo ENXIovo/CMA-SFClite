@@ -1194,14 +1194,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Local SAE feature cut/gate (bias-ranked)")
     parser.add_argument("--model", type=str, default="gpt2")
     parser.add_argument("--ranking_csv", type=str, default="results/gpt2-small_nurse_man_20251110_181041.csv")
-    parser.add_argument("--output", type=str, default="results/nie_local_cut_gate.csv")
+    parser.add_argument("--output", type=str, default="results/local_cut_gate.csv")
     parser.add_argument("--prompt_split", type=str, default="test", choices=["train", "val", "test", "all"])
     parser.add_argument("--topk", type=int, default=5)
     parser.add_argument("--num_features", type=int, default=1000)
-    parser.add_argument("--num_features_range", type=int, nargs=3, default=[0, 32000, 1000], help="start end step（含端点）生成多档 feature 数（唯一多档来源）")
-    parser.add_argument("--alphas", type=float, nargs="+", default=[0.1, 0.5])
-    parser.add_argument("--alpha_range", type=float, nargs=3, default=[0.0, 1.0, 0.1], help="可选：start end step，为 α 生成多档值；若提供则覆盖 --alphas")
-    parser.add_argument("--nie_mode", type=str, default="heads", choices=["local", "heads", "full"])
+    parser.add_argument("--num_features_range", type=int, nargs=3, default=[0, 15, 1], help="start end step（含端点）生成多档 feature 数（唯一多档来源）")
+    parser.add_argument("--alphas", type=float, nargs="+", default=[])
+    parser.add_argument("--alpha_range", type=float, nargs=3, default=[0, 1, 0.01], help="可选：start end step，为 α 生成多档值；若提供则覆盖 --alphas")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--corpus_path", type=str, default="data/WikiText.txt")
@@ -1231,7 +1230,6 @@ def main() -> None:
         topk=args.topk,
         feature_counts=feature_counts,
         alphas=alphas,
-        nie_mode=args.nie_mode,
         seed=args.seed,
         device=args.device,
         corpus_path=args.corpus_path,
