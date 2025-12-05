@@ -713,9 +713,16 @@ def run_local_cut_gate(
     }
 
     corpus_tokens = tokenize_corpus(model, corpus_path, max_corpus_tokens=max_corpus_tokens)
-    baseline_corpus_ppl = compute_corpus_perplexity(model, corpus_tokens) if corpus_tokens is not None else float("nan")
+    baseline_corpus_ppl = (
+        compute_corpus_perplexity(model, corpus_tokens) if corpus_tokens is not None else float("nan")
+    )
 
-    for ex_idx, example in enumerate(tqdm(examples, desc="Examples")):
+    # 全局进度条：按 (example, feature_count, alpha) 粒度统计总步数，实时显示整体进度
+    steps_per_example = max(1, len(unique_feature_counts) * max(1, len(unique_alphas)))
+    total_steps = len(examples) * steps_per_example
+    pbar = tqdm(total=total_steps, desc="Examples×features×α", leave=False)
+
+    for ex_idx, example in enumerate(examples):
         base_prompt = example.get("base", example.get("clean_prefix", ""))
         cf_prompt = example.get("counterfactual", example.get("patch_prefix", ""))
         if not base_prompt or not cf_prompt:
@@ -808,6 +815,9 @@ def run_local_cut_gate(
             entry["delta_nie"].append(float(abs(nie_after) - abs(fc_to_nie_before[fc])))
             entry["examples"].append(ex_idx)
             entry["feature_sets"].append(feature_label)
+            pbar.update(1)
+
+    pbar.close()
 
     results: List[Dict] = []
     for fc, alpha in scenarios:
@@ -1062,13 +1072,16 @@ def plot_baseline_results(rows: List[Dict], csv_path: str) -> None:
                 "edit_label": [r.get("edit_label") for r in aggregate_rows],
             }
         )
+        # 为了让 alpha=0 也能被看见，构造一个带下限的可视化用 alpha
+        df["alpha_vis"] = df["alpha"].fillna(0.0).apply(lambda a: max(0.05, float(a)))
 
         fig1 = px.scatter(
             df,
             x="delta_nie",
             y="delta_ppl",
             color="feature_count",
-            size="alpha",
+            size="alpha_vis",
+            size_min=5,
             hover_data=["edit_label", "alpha"],
             title="Δ|NIE| vs ΔPPL (local cut/gate)",
             template="simple_white",
@@ -1082,7 +1095,8 @@ def plot_baseline_results(rows: List[Dict], csv_path: str) -> None:
             x="remaining_nie_pct",
             y="delta_ppl",
             color="feature_count",
-            size="alpha",
+            size="alpha_vis",
+            size_min=5,
             hover_data=["edit_label", "alpha"],
             title="Bias–PPL (Remaining NIE% vs ΔPPL, local cut/gate)",
             template="simple_white",
