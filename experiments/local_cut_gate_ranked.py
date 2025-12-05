@@ -479,37 +479,37 @@ def apply_multi_layer_alpha_gate(
     submodules: Sequence[Submodule],
     dictionaries: Dict[Submodule, SAE],
     base_prompt: str,
-    cf_prompt: str,
     layer_to_indices: Dict[int, Optional[List[int]]],
     alpha: float,
-) -> Tuple[float, float, float, float, float]:
+) -> Tuple[float, float, float, float]:
+    """
+    在多个层上对选中的 SAE 特征做缩放，返回:
+    - bias_clean: 原始 she-he logits 差
+    - bias_gated: edit 后 she-he logits 差
+    - ppl_clean: 原始 PPL
+    - ppl_gated: edit 后 PPL
+    （不再返回 NIE，按用户需求仅使用 remaining bias 与 ΔPPL）
+    """
     clean_tokens = tokenize_prompt(model, base_prompt)
-    patch_base_tokens = tokenize_prompt(model, base_prompt)
-    patch_cf_tokens = tokenize_prompt(model, cf_prompt)
+    patch_tokens = tokenize_prompt(model, base_prompt)
 
     nodes = _build_nodes_for_layers(submodules, dictionaries, layer_to_indices)
 
     with torch.no_grad():
         logits_clean = model(clean_tokens, return_type="logits")
 
-    hooks_base = _multi_layer_hooks(model, patch_base_tokens, submodules, dictionaries, nodes, alpha)
+    hooks_base = _multi_layer_hooks(model, patch_tokens, submodules, dictionaries, nodes, alpha)
     with torch.no_grad():
         logits_gated = model.run_with_hooks(clean_tokens, fwd_hooks=hooks_base, return_type="logits")
-
-    hooks_cf = _multi_layer_hooks(model, patch_cf_tokens, submodules, dictionaries, nodes, alpha)
-    with torch.no_grad():
-        logits_cf = model.run_with_hooks(clean_tokens, fwd_hooks=hooks_cf, return_type="logits")
 
     tokens_base_1d = clean_tokens[0]
     id_she = model.tokenizer(" she", add_special_tokens=False)["input_ids"][0]
     id_he = model.tokenizer(" he", add_special_tokens=False)["input_ids"][0]
     bias_clean = (logits_clean[0, -1, id_she] - logits_clean[0, -1, id_he]).item()
     bias_gated = (logits_gated[0, -1, id_she] - logits_gated[0, -1, id_he]).item()
-    bias_cf_replaced = (logits_cf[0, -1, id_she] - logits_cf[0, -1, id_he]).item()
     ppl_clean = _perplexity_from_logits(logits_clean[0], tokens_base_1d)
     ppl_gated = _perplexity_from_logits(logits_gated[0], tokens_base_1d)
-    nie = bias_cf_replaced - bias_clean
-    return bias_clean, bias_gated, ppl_clean, ppl_gated, nie
+    return bias_clean, bias_gated, ppl_clean, ppl_gated
 
 
 @dataclass
@@ -637,7 +637,6 @@ def run_local_cut_gate(
     topk: int,
     feature_counts: List[int],
     alphas: List[float],
-    nie_mode: str,
     seed: int,
     device: str,
     corpus_path: Optional[str],
@@ -747,72 +746,36 @@ def run_local_cut_gate(
                     per_layer[layer] = ranking[: min(fc, len(ranking))]
             fc_to_indices[fc] = per_layer
 
-        fc_to_nie_before: Dict[int, float] = {}
+        # 记录当前样本在不同 feature_count 下各层的选中特征索引
         for fc, layer_to_indices in fc_to_indices.items():
-            _, _, _, _, nie_local = apply_multi_layer_alpha_gate(
-                model=model,
-                submodules=submodules,
-                dictionaries=dictionaries,
-                base_prompt=base_prompt,
-                cf_prompt=cf_prompt,
-                layer_to_indices=layer_to_indices,
-                alpha=1.0,
-            )
-            if nie_mode == "local":
-                fc_to_nie_before[fc] = nie_local
-            elif nie_mode == "heads":
-                effects = run_gender_bias_cma(
-                    model,
-                    base_prompt,
-                    cf_prompt,
-                    verbose=False,
-                    include_heads_by_layer=include_map,
+            for layer, idxs in layer_to_indices.items():
+                feature_rows.append(
+                    {
+                        "example_idx": ex_idx,
+                        "feature_count": fc,
+                        "layer": layer,
+                        # 用逗号分隔的索引列表，便于后处理
+                        "feature_indices": ",".join(str(int(i)) for i in idxs),
+                    }
                 )
-                fc_to_nie_before[fc] = float(sum(sum(row) for row in effects))
-            else:
-                effects = run_gender_bias_cma(model, base_prompt, cf_prompt, verbose=False)
-                fc_to_nie_before[fc] = float(sum(sum(row) for row in effects))
 
         for fc, alpha in scenarios:
             layer_to_indices = fc_to_indices[fc]
             feature_label = format_layer_indices(layer_to_indices)
-            bias_clean, bias_edit, ppl_clean, ppl_edit, nie_local = apply_multi_layer_alpha_gate(
+            bias_clean, bias_edit, ppl_clean, ppl_edit = apply_multi_layer_alpha_gate(
                 model=model,
                 submodules=submodules,
                 dictionaries=dictionaries,
                 base_prompt=base_prompt,
-                cf_prompt=cf_prompt,
                 layer_to_indices=layer_to_indices,
                 alpha=alpha,
             )
-
-            if nie_mode == "local":
-                nie_after = nie_local
-            else:
-                hooks_eval = []
-                for sub in submodules:
-                    feats = layer_to_indices.get(sub.layer, [])
-                    hook_fn = make_scaling_hook(dictionaries[sub], feats, alpha)
-                    hooks_eval.append((sub.hook_name, hook_fn))
-                with model.hooks(fwd_hooks=hooks_eval):
-                    if nie_mode == "heads":
-                        eff = run_gender_bias_cma(
-                            model,
-                            base_prompt,
-                            cf_prompt,
-                            verbose=False,
-                            include_heads_by_layer=include_map,
-                        )
-                    else:
-                        eff = run_gender_bias_cma(model, base_prompt, cf_prompt, verbose=False)
-                nie_after = float(sum(sum(row) for row in eff))
 
             entry = stats[(fc, alpha)]
             entry["bias_clean"].append(float(bias_clean))
             entry["bias_edit"].append(float(bias_edit))
             entry["ppl_clean"].append(float(ppl_clean))
             entry["ppl_edit"].append(float(ppl_edit))
-            entry["delta_nie"].append(float(abs(nie_after) - abs(fc_to_nie_before[fc])))
             entry["examples"].append(ex_idx)
             entry["feature_sets"].append(feature_label)
             pbar.update(1)
@@ -828,7 +791,6 @@ def run_local_cut_gate(
         mean_bias_edit = float(np.mean(entry["bias_edit"]))
         mean_ppl_clean = float(np.mean(entry["ppl_clean"]))
         mean_ppl_edit = float(np.mean(entry["ppl_edit"]))
-        mean_delta_nie = float(np.mean(entry["delta_nie"])) if entry["delta_nie"] else float("nan")
         remaining_pct = (
             float(abs(mean_bias_edit) / (abs(mean_bias_clean) + 1e-9))
             if abs(mean_bias_clean) > 1e-9
@@ -871,7 +833,6 @@ def run_local_cut_gate(
             "ppl_edited_mean": mean_ppl_edit,
             "delta_ppl_mean": delta_prompt_ppl,
             "remaining_bias_pct": remaining_pct,
-            "delta_nie_mean": mean_delta_nie,
             "corpus_ppl_original": baseline_corpus_ppl,
             "corpus_ppl_edited": gated_corpus_ppl,
             "delta_corpus_ppl": delta_corpus_ppl,
@@ -880,7 +841,6 @@ def run_local_cut_gate(
             "mediator_head": None,
             "mediator_nie": None,
             "mediator_category": "topk_layers",
-            "nie_source": nie_mode,
             "example_count": len(entry["bias_clean"]),
             "top_features_snapshot": entry["feature_sets"][:3],
         }
@@ -1075,105 +1035,24 @@ def plot_baseline_results(rows: List[Dict], csv_path: str) -> None:
         # 为了让 alpha=0 也能被看见，构造一个带下限的可视化用 alpha
         df["alpha_vis"] = df["alpha"].fillna(0.0).apply(lambda a: max(0.05, float(a)))
 
-        fig1 = px.scatter(
-            df,
-            x="delta_nie",
-            y="delta_ppl",
-            color="feature_count",
-            size="alpha_vis",
-            size_min=5,
-            hover_data=["edit_label", "alpha"],
-            title="Δ|NIE| vs ΔPPL (local cut/gate)",
-            template="simple_white",
-        )
-        html1 = f"{base_path}_nie_scatter.html"
-        fig1.write_html(html1)
-        print(f"✓ 绘制 NIE-ΔPPL 交互图: {html1}")
-
         fig2 = px.scatter(
             df,
-            x="remaining_nie_pct",
+            x="remaining_bias_pct",
             y="delta_ppl",
             color="feature_count",
             size="alpha_vis",
-            size_min=5,
             hover_data=["edit_label", "alpha"],
-            title="Bias–PPL (Remaining NIE% vs ΔPPL, local cut/gate)",
+            title="Bias–PPL (Remaining bias% vs ΔPPL, local cut/gate)",
             template="simple_white",
         )
         html2 = f"{base_path}_bias_ppl.html"
         fig2.write_html(html2)
         print(f"✓ 绘制 Bias–PPL 交互图: {html2}")
-    except Exception:
-        pass
-
-
-def plot_nie_vs_ppl(rows: List[Dict], csv_path: str) -> None:
-    from matplotlib.colors import Normalize
-
-    scatter_points = []
-    for row in rows:
-        nie_delta = row.get("delta_nie_mean")
-        delta = _select_delta_ppl(row)
-        if nie_delta is None or delta is None:
-            continue
-        if isinstance(nie_delta, float) and np.isnan(nie_delta):
-            continue
-        if isinstance(delta, float) and np.isnan(delta):
-            continue
-        scatter_points.append((nie_delta, delta, row))
-
-    if not scatter_points:
-        return
-
-    nf_vals = [point[2].get("feature_count", 0.0) for point in scatter_points]
-    nf_min, nf_max = (min(nf_vals), max(nf_vals)) if nf_vals else (0.0, 1.0)
-    nf_norm = Normalize(vmin=nf_min, vmax=nf_max if nf_max != nf_min else nf_min + 1)
-    cmap = plt.get_cmap("plasma")
-
-    plt.figure(figsize=(8, 5))
-    color_ref = None
-    feature_sources = sorted({point[2].get("feature_source", "unknown") for point in scatter_points})
-    for source in feature_sources:
-        subset = [point for point in scatter_points if point[2].get("feature_source", "unknown") == source]
-        if not subset:
-            continue
-        xs = [point[0] for point in subset]
-        ys = [point[1] for point in subset]
-        colors = [point[2].get("feature_count", 0.0) for point in subset]
-        marker = FEATURE_SOURCE_MARKERS.get(source, "o")
-        sizes = [
-            30.0 + 70.0 * float(point[2].get("alpha", 0.0))
-            for point in subset
-        ]
-        scatter = plt.scatter(
-            xs,
-            ys,
-            c=colors,
-            cmap=cmap,
-            norm=nf_norm,
-            marker=marker,
-            s=sizes,
-            alpha=0.85,
-            edgecolors="none",
-        )
-        color_ref = color_ref or scatter
-
-    if color_ref:
-        cbar = plt.colorbar(color_ref)
-        cbar.set_label("num_features")
-
-    plt.xlabel("Δ|NIE|")
-    plt.ylabel("ΔPPL")
-    plt.title("SAE Multi-Layer Random Cut: Δ|NIE| vs ΔPPL")
-    handles, labels = plt.gca().get_legend_handles_labels()
-    if handles:
-        plt.legend(handles, labels)
-    plt.grid(True, alpha=0.3)
-    plot_path = os.path.splitext(csv_path)[0] + "_nie_scatter.png"
-    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"✓ 绘制 NIE-ΔPPL 散点图: {plot_path}")
+    except ImportError as e:
+        print(f"⚠ 跳过 HTML 交互图生成（缺少依赖）: {e}")
+        print("   如需生成 HTML，请安装: pip install pandas plotly")
+    except Exception as e:
+        print(f"⚠ 生成 HTML 交互图时出错: {e}")
 
 
 def plot_alpha_pareto_lines(rows: List[Dict], csv_path: str) -> None:
