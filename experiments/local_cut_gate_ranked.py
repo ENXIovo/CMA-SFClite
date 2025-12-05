@@ -17,8 +17,8 @@ import torch
 from sae_lens import SAE
 from transformer_lens import HookedTransformer
 from tqdm import tqdm
+from datetime import datetime
 
-from .cma_gender_bias import run_gender_bias_cma
 from .prompts_winogender import get_prompt_examples
 
 
@@ -653,8 +653,22 @@ def run_local_cut_gate(
         print(f"Feature counts: {len(feature_counts)} 档, 范围 [{min(feature_counts)}, {max(feature_counts)}]")
     if alphas:
         print(f"α: {len(alphas)} 档, 范围 [{min(alphas):.3f}, {max(alphas):.3f}]")
-    print(f"NIE 模式: {nie_mode}")
     print("=" * 70)
+
+    # 根据参数与时间戳拼接输出文件名，便于区分实验
+    base_out, ext_out = os.path.splitext(output_path)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if feature_counts:
+        feat_tag = f"f{min(feature_counts)}-{max(feature_counts)}"
+    else:
+        feat_tag = "f0"
+    if alphas:
+        feat_alpha = [float(a) for a in alphas]
+        alpha_tag = f"a{min(feat_alpha):.2f}-{max(feat_alpha):.2f}"
+    else:
+        alpha_tag = "a"
+    output_path = f"{base_out}_topk{topk}_{feat_tag}_{alpha_tag}_{ts}{ext_out}"
+    print(f"输出文件: {output_path}")
 
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -704,12 +718,13 @@ def run_local_cut_gate(
             "bias_edit": [],
             "ppl_clean": [],
             "ppl_edit": [],
-            "delta_nie": [],
             "examples": [],
             "feature_sets": [],
         }
         for fc, alpha in scenarios
     }
+    # 额外记录：每个样本在每个 feature_count 下剪掉了哪些特征（按层）
+    feature_rows: List[Dict] = []
 
     corpus_tokens = tokenize_corpus(model, corpus_path, max_corpus_tokens=max_corpus_tokens)
     baseline_corpus_ppl = (
@@ -858,8 +873,17 @@ def run_local_cut_gate(
 
     print(f"\n✓ 结果已写入 {output_path}")
     plot_baseline_results(results, output_path)
-    plot_nie_vs_ppl(results, output_path)
     plot_alpha_pareto_lines(results, output_path)
+    # 写出特征级别日志
+    if feature_rows:
+        base_path, ext = os.path.splitext(output_path)
+        feat_path = f"{base_path}_features.csv"
+        with open(feat_path, "w", newline="", encoding="utf-8") as f_feat:
+            fieldnames_feat = sorted({key for row in feature_rows for key in row.keys()})
+            writer_feat = csv.DictWriter(f_feat, fieldnames=fieldnames_feat)
+            writer_feat.writeheader()
+            writer_feat.writerows(feature_rows)
+        print(f"✓ 特征选择日志已写入 {feat_path}")
     return output_path
 
 
