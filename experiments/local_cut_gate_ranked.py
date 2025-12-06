@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import re
 from collections import namedtuple
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -736,11 +737,19 @@ def run_local_cut_gate(
     total_steps = len(examples) * steps_per_example
     pbar = tqdm(total=total_steps, desc="Examples×features×α", leave=False)
 
+    PRONOUN_PATTERN = r"\b(she|he|they|it|him|her|them)\b"
+
     for ex_idx, example in enumerate(examples):
-        base_prompt = example.get("base", example.get("clean_prefix", ""))
-        cf_prompt = example.get("counterfactual", example.get("patch_prefix", ""))
-        if not base_prompt or not cf_prompt:
+        # 先取原始句子 / 前缀
+        raw_base = example.get("base", example.get("clean_prefix", ""))
+        raw_cf   = example.get("counterfactual", example.get("patch_prefix", ""))
+        if not raw_base or not raw_cf:
             continue
+
+        # 切到第一个代词之前；如果找不到代词，就保留整句
+        base_prompt = re.split(PRONOUN_PATTERN, raw_base, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        cf_prompt   = re.split(PRONOUN_PATTERN, raw_cf,   maxsplit=1, flags=re.IGNORECASE)[0].strip()
+
 
         layer_rankings = rank_features_for_layers(
             model=model,
@@ -1198,9 +1207,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt_split", type=str, default="test", choices=["train", "val", "test", "all"])
     parser.add_argument("--topk", type=int, default=5)
     parser.add_argument("--num_features", type=int, default=1000)
-    parser.add_argument("--num_features_range", type=int, nargs=3, default=[0, 15, 1], help="start end step（含端点）生成多档 feature 数（唯一多档来源）")
+    parser.add_argument("--num_features_range", type=int, nargs=3, default=[0, 15, 5], help="start end step（含端点）生成多档 feature 数（唯一多档来源）")
     parser.add_argument("--alphas", type=float, nargs="+", default=[])
-    parser.add_argument("--alpha_range", type=float, nargs=3, default=[0, 1, 0.01], help="可选：start end step，为 α 生成多档值；若提供则覆盖 --alphas")
+    parser.add_argument("--alpha_range", type=float, nargs=3, default=[0, 1, 0.1], help="可选：start end step，为 α 生成多档值；若提供则覆盖 --alphas")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--corpus_path", type=str, default="data/WikiText.txt")

@@ -24,8 +24,16 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
+import re
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
+
+# Add parent directory to path to allow imports when running directly
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_parent_dir = os.path.dirname(_script_dir)
+if _parent_dir not in sys.path:
+    sys.path.insert(0, _parent_dir)
 
 import numpy as np
 import pandas as pd
@@ -59,6 +67,16 @@ from .sfc_lite_engine import (
 # CMA (per-head) to compute NIE matrix
 from .cma_gender_bias import run_gender_bias_cma
 
+PRONOUN_RE = re.compile(r"\b(she|he|they|it|him|her|them)\b", re.IGNORECASE)
+
+def strip_after_pronoun(text: str) -> str:
+    """
+    保留第一次出现 she/he/... 之前的前缀；如果没有代词，就原样返回。
+    """
+    if not text:
+        return text
+    parts = PRONOUN_RE.split(text, maxsplit=1)
+    return parts[0].strip()
 
 def parse_args():
     ap = argparse.ArgumentParser("Pareto sweep for SFC-lite (budget vs. bias improvement)")
@@ -267,17 +285,26 @@ def main():
         for (L, h, nie) in topk:
             print(f"  L{L:02d} H{h:02d}  NIE={nie:+.4f}")
 
-    # Load prompt pairs for averaging
     examples = get_prompt_examples(args.prompt_split)
     pairs = []
     for ex in examples:
-        base = ex.get("base", ex.get("clean_prefix", ""))
-        cf = ex.get("counterfactual", ex.get("patch_prefix", ""))
+        # 优先使用 clean_prefix / patch_prefix；没有的话再退回 base/counterfactual
+        raw_base = ex.get("clean_prefix", ex.get("base", ""))
+        raw_cf   = ex.get("patch_prefix", ex.get("counterfactual", ""))
+        if not raw_base or not raw_cf:
+            continue
+
+        base = strip_after_pronoun(raw_base)
+        cf   = strip_after_pronoun(raw_cf)
         if base and cf:
             pairs.append((base, cf))
+
     if not pairs:
-        # fallback to single pair from args
-        pairs = [(args.prompt_base, args.prompt_cf)]
+        # fallback: 命令行提供的 base/cf 也走同样的前缀逻辑
+        base_fallback = strip_after_pronoun(args.prompt_base)
+        cf_fallback   = strip_after_pronoun(args.prompt_cf)
+        pairs = [(base_fallback, cf_fallback)]
+
 
     # Build selected heads map for head-mode NIE
     include_map = {}

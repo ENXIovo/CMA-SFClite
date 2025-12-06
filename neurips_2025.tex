@@ -1,0 +1,283 @@
+\documentclass{article}
+
+% "preprint" option is used for arXiv or other preprint submissions
+\usepackage[preprint]{neurips_2025}
+
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{xcolor}         % colors
+\usepackage{enumerate}
+\usepackage{natbib}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\bibliographystyle{unsrtnat}
+
+\title{Pareto-Efficient Debiasing via Causal Localization and Local Circuit Edits}
+
+\author{%
+  Haoyang Yin \\
+  Department of Computer Science\\
+  Boston University\\
+  \texttt{yinhaoya@gmail.com} \\
+  \And
+  Qiji Zheng \\
+  Department of Computer Science \\
+  Boston University \\
+  \texttt{qjzheng@bu.edu} \\
+  \AND
+  Qiao Zhao \\
+  Department of Computer Science \\
+  Boston University \\
+  \texttt{zhaoqiao@bu.edu} \\
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+  We study Pareto-efficient debiasing for language models by combining causal localization with lightweight, local circuit edits. Using causal mediation analysis (CMA), we localize a small set of attention heads most responsible for propagating gender-related bias signals, measured via Natural Indirect Effect (NIE) on contrastive gender prompts. We then perform fine-grained edits using sparse autoencoders (SAEs) to suppress head-attributed features while preserving the residual stream, enabling targeted bias reduction with minimal degradation of linguistic capacity (perplexity). Midway, we have implemented the full CMA localization pipeline on GPT-2 small and two intervention strategies: a head zero-out baseline and an SAE-based SFC-lite steering method. We report matched experiments at Top-K $\in \{1, 5\}$ for both methods and present Bias--Perplexity Pareto curves and ``remaining bias vs.\ $\Delta$PPL'' trade-offs. Early trends suggest that SFC-lite achieves larger reductions in $|\text{NIE}|$ 
+(i.e., more negative $\Delta|\text{NIE}|$) at comparable or lower $\Delta$PPL than head ablations, supporting the promise of causal localization plus localized feature edits.
+\end{abstract}
+
+\section{Introduction}
+
+Stereotypical bias in language models manifests when model predictions systematically favor associations that reflect societal stereotypes (e.g., gendered occupations), rather than neutral semantic content. Addressing such bias is important for fairness, safety, and reliability, yet interventions must avoid degrading overall linguistic competence, as measured by perplexity and downstream utility.
+
+Prior work spans alignment and supervised fine-tuning, model editing, and mechanistic interpretability-driven interventions. Coarse interventions such as ablating entire heads or layers can reduce apparent bias but often incur substantial collateral damage (perplexity increases, general capability loss). By contrast, causal localization methods---such as causal mediation analysis (CMA)---identify where bias flows in the computation. However, turning localization into minimally invasive edits is non-trivial.
+
+We propose a closed-loop approach: first, use CMA to localize a small set of attention heads with high Natural Indirect Effect (NIE) on bias-sensitive outputs; second, apply fine-grained, local circuit edits using sparse autoencoders (SAEs) attached to the residual stream, leveraging head-level attribution to target only the implicated SAE features. This SFC-lite style feature modulation aims to suppress bias-carrying features while preserving most of the residual signal, thereby improving the Bias--Perplexity Pareto trade-off.
+
+Midway progress: we implemented the CMA pipeline on GPT-2 small, identified Top-K heads (K $\in \{1,5\}$) by NIE, and built two matched intervention strategies: (i) a head zero-out baseline and (ii) an SAE-based feature steering method (SFC-lite). We report matched evaluations with $\Delta$NIE and $\Delta$PPL, as well as ``remaining bias (\%) vs.\ $\Delta$PPL,'' and include the resulting figures.
+
+\section{Related Work}
+
+In this section, we introduce two most relevant research topics: Causal Mediation Analysis and Sparse Autoencoders.
+
+\subsection{Causal Mediation Analysis}
+Causal mediation analysis (CMA) has been widely applied to isolate and measure effects mediated by latent intermediate variables in a causal graph. \citet{CMA} abstract the computation structure of language models as a causal graph and use neuron interventions to study individual contributions to specific behaviors.
+
+\subsection{Sparse Autoencoders}
+Sparse autoencoders (SAEs) are neural networks trained to reconstruct their input under sparsity penalties. Recently, SAEs have been deployed to address the problem of polysemanticity and produce human-interpretable features~\citep{SAEInterp}, and to control the behavior of models via feature-level steering~\citep{SAESteer}.
+
+\section{Methodology}
+
+\subsection{CMA localization}\label{cma_loc}
+\textbf{Setup.} On GPT-2 small, we compute total effect (TE) and per-mediator Natural Indirect Effect (NIE) at post-attention and post-MLP residual additions on the bias-critical generation step. For each mediator \(m\) (e.g., an attention head output at layer \(l\), head \(h\)), we perform single-site replacement: replace \(m\)'s activation under the ``treated'' prompt (e.g., a gendered variant) with the corresponding activation from a ``control'' prompt while holding other activations fixed. The change in the target token's logit/probability is attributed to \(m\)'s mediated effect, yielding an NIE estimate.
+
+\textbf{Estimation.} For a contrastive prompt pair differing only in a gender attribute, let \(y\) be a bias-sensitive target token. Let \(f(\cdot)\) denote the model and \(a_m\) the activation of mediator \(m\). We measure
+\[
+\text{NIE}(m) \approx f\bigl(\text{treated}; a_m \leftarrow a_m^{\text{control}}\bigr) - f(\text{treated}),
+\]
+where the difference is read off the logit (or probability) of \(y\). We rank mediators by \(|\text{NIE}(m)|\) and select the Top-\(K\) attention heads for intervention. We also include fake-replacement controls at low-NIE units and/or non-critical positions to bound background variance and perturbation artifacts. The CMA output is a list of tuples \((l, h, \text{NIE})\), which defines the surgical plan.
+
+\subsection{Model Editing}
+
+After identifying the Top-K attention heads with the highest significant NIE with respect to gender bias, we perform a fine-grained feature modulation on the corresponding SAE features.
+
+Specifically, given a residual stream vector $\mathbf{h} \in \mathbb{R}^{d}$ (e.g., post-attention at layer $l$), we attach an SAE parameterized by an encoder $\mathbf{W}_{\mathrm{enc}} \in \mathbb{R}^{c \times d}$, decoder $\mathbf{W}_{\mathrm{dec}} \in \mathbb{R}^{d \times c}$, and biases $\mathbf{b}_{\mathrm{enc}}, \mathbf{b}_{\mathrm{dec}}$:
+\begin{align}
+    \mathbf{a}  &= \sigma(\mathbf{W}_{\mathrm{enc}}\mathbf{h} + \mathbf{b}_{\mathrm{enc}}),\\
+    \hat{\mathbf{h}} &= \mathbf{W}_{\mathrm{dec}}\mathbf{a} + \mathbf{b}_{\mathrm{dec}},
+\end{align}
+and define the reconstruction residual
+\begin{equation}
+    \boldsymbol{\epsilon} = \mathbf{h} - \hat{\mathbf{h}},
+\end{equation}
+which caches information not captured by the SAE.
+
+To apply head-specific intervention on the SAE feature vector $\mathbf{a}\in \mathbb{R}^c$, we run a head-attribution procedure to identify a subset of SAE features that are primarily activated by a given attention head $A_{l,h}$. These features are marked for attenuation or erasure. Denote the intervened feature vector by $\tilde{\mathbf{a}}$. The final edited residual stream is
+\begin{equation}
+    \tilde{\mathbf{h}} = \mathbf{W}_{\mathrm{dec}}\tilde{\mathbf{a}} + \mathbf{b}_{\mathrm{dec}} + \boldsymbol{\epsilon}.
+\end{equation}
+Edits are applied at the appropriate points in the computational graph, preserving the rest of the residual stream and thereby limiting collateral damage.
+
+\section{Experiments}
+
+We conduct experiments to answer the following research questions:
+\begin{itemize}
+    \item \textbf{RQ1}: Does CMA provide a reliable prior for identifying bias-promoting submodules? (RandomSurgery)
+    \item \textbf{RQ2}: Does SAE-based steering preserve more linguistic capacity than zeroing out entire heads? (HeadOff/ZeroOut)
+    \item \textbf{RQ3}: Does head-level attribution over SAE features further improve Pareto efficiency compared to random feature deletion? (RandomCut)
+\end{itemize}
+
+\subsection{Experiment Details}
+
+\textbf{Model.} We evaluate several debiasing strategies on GPT-2 small~\citep{GPT2}, a 12-layer decoder-only Transformer with 12 attention heads and 117M parameters. We use the official SAE release trained on the post-attention residual stream.
+
+\textbf{Evaluation metrics.} 
+We report $\Delta|\text{NIE}| := |\text{NIE}|_{\text{after}} - |\text{NIE}|_{\text{before}}$ (more negative is better).
+
+To evaluate the effectiveness of an intervention plan, we report the change in Natural Indirect Effect ($\Delta$NIE). A more negative $\Delta$NIE (i.e., a large reduction in $|\text{NIE}|$) indicates that more bias-related signal is suppressed. To quantify side effects, we also report the change in perplexity ($\Delta$PPL) evaluated on WikiText~\citep{wikitext}. Smaller $\Delta$PPL indicates better preservation of linguistic capacity.
+
+\subsection{Baseline Selection}
+
+Having computed head-level causal effects in \S\ref{cma_loc}, our surgery plan $P$ is parameterized by the number of heads $K$, the number of features per layer $N$, and a global budget $B$ (e.g., total features suppressed). To compare the effectiveness and side effects of our method, and to answer the three research questions, we design the following baselines: \textbf{RandomSurgery}, \textbf{ZeroOut}, and \textbf{RandomCut}.
+
+\textbf{RandomSurgery.} Given the plan $P$, a number of layers $L$, and a number of features to suppress per layer $N$, we randomly select $L$ layers and suppress the top-$N$ SAE features in each selected layer, ignoring CMA scores. This tests whether CMA localization provides a useful prior beyond random feature removal under a comparable budget.
+
+\textbf{ZeroOut (HeadOff).} Given $P$ and the Top-$K$ heads selected for intervention, we zero out their post-attention activations. This is a coarse but simple debiasing method and serves as our primary head-level baseline.
+
+\textbf{RandomCut.} Given $P$ and the corresponding $K$ heads to be intervened, we identify their associated SAE features and then randomly erase a fraction $p\%$ of these features, where $p$ is swept from low to high budgets. This allows us to compare targeted head-attributed feature edits against random feature deletion at the same sparsity level.
+
+\textbf{SFC-lite (ours).} For each CMA-selected head, we identify attributed SAE features and attenuate or erase only those features at the corresponding layer, reconstructing $\tilde{\mathbf{h}}$ via the SAE while preserving the residual $\boldsymbol{\epsilon}$. This realizes a localized feature-level intervention grounded in causal localization.
+
+\subsection{Expected Results}
+
+We state our hypotheses for each research question, which guide the remaining experiments after the midterm milestone.
+
+\textbf{RQ1 (CMA vs.\ RandomSurgery).} If CMA provides a reliable prior for identifying intervention targets, then under a fixed editing budget (same number of layers and features suppressed), \textbf{RandomSurgery} should perform strictly worse on the Bias--Perplexity Pareto frontier. Concretely, we expect that:
+\begin{itemize}
+    \item CMA-guided edits will achieve larger reductions in $|\text{NIE}|$ than RandomSurgery at comparable $\Delta$PPL; and
+    \item when matching $\Delta$NIE, RandomSurgery will incur noticeably larger $\Delta$PPL due to deleting features unrelated to gender bias.
+\end{itemize}
+Empirically, this should manifest as CMA-based points dominating RandomSurgery points (i.e., lying closer to the lower-left corner) in both the $\Delta|\text{NIE}|$ vs.\ $\Delta$PPL and Remaining bias vs.\ $\Delta$PPL plots.
+
+\textbf{RQ2 (SAE steering vs.\ ZeroOut).} If SAE-based steering better preserves linguistic capacity than head ablation, then for matched Top-$K$:
+\begin{itemize}
+    \item SFC-lite and ZeroOut should achieve similar reductions in bias (comparable $\Delta$NIE and Remaining bias), because both act on CMA-selected heads; but
+    \item SFC-lite should incur lower $\Delta$PPL on average, especially at larger $K$, by modifying only head-attributed SAE features and leaving the rest of the residual stream intact.
+\end{itemize}
+We therefore expect SFC-lite points to lie below or on top of the ZeroOut points when plotted in Remaining bias vs.\ $\Delta$PPL space, forming a strictly better or comparable Pareto frontier.
+
+\textbf{RQ3 (Head attribution vs.\ RandomCut).} If head-level attribution over SAE features is useful, then \textbf{RandomCut}---which removes a comparable number of SAE features but without using attribution scores---should underperform SFC-lite:
+\begin{itemize}
+    \item For the same number of removed features, RandomCut should either reduce $|\text{NIE}|$ less (because it removes many irrelevant features) or increase $\Delta$PPL more (because it deletes useful features);
+    \item As the deletion fraction $p$ grows, RandomCut is expected to rapidly degrade perplexity without commensurate gains in bias reduction, whereas SFC-lite should reach similar or better bias levels with substantially smaller $\Delta$PPL.
+\end{itemize}
+Thus we anticipate SFC-lite to trace a Pareto frontier that is consistently closer to the lower-left corner than RandomCut, demonstrating the benefit of using CMA-based head localization and attribution-guided feature selection.
+
+\paragraph{Runs completed.} For the midterm milestone, we ran matched comparisons at Top-K $\in \{1, 5\}$ for:
+\begin{enumerate}
+    \item ZeroOut (head ablation), and
+    \item SFC-lite (SAE feature steering).
+\end{enumerate}
+This yields four runs; for each run, we include two plots: (i) $\Delta|\text{NIE}|$ vs.\ $\Delta$PPL and (ii) Remaining bias (\%) vs.\ $\Delta$PPL. In addition, we swept RandomCut budgets for the SAE-based random ablation baseline to probe RQ1 and RQ3.
+
+\subsection{Current Results}
+
+We include the figures (two per run) below. Throughout, we report
+\[
+\Delta|\text{NIE}| = |\text{NIE}|_{\text{after}} - |\text{NIE}|_{\text{before}}
+\]
+(more negative is better) and plot Remaining NIE (\%) $= |\text{NIE}|_{\text{after}} / |\text{NIE}|_{\text{before}} \times 100$. Qualitatively, we observe:
+
+\begin{itemize}
+    \item \textbf{ZeroOut/HeadOff, Top-K=1}: modest bias reduction with low cost. 
+    Remaining NIE typically lies in $93\%\text{--}100\%$; $\Delta$PPL is mostly $\le 0.5$ 
+    (with a few points up to $\approx 0.9$). This suggests that zeroing a single CMA-selected
+    head is a gentle but limited intervention.
+    \item \textbf{HeadOff, Top-K=5}: produces substantially larger bias reduction than Top-K=1, but at a noticeably higher perplexity cost. 
+    From the scatter, $\Delta|$NIE$|$ falls in the range $\mathbf{-0.25}$ to $\mathbf{-0.05}$, corresponding to 
+    Remaining NIE concentrated around $\mathbf{70\%\text{--}95\%}$ (with a few outliers up to $\sim\!105\%$). 
+    Meanwhile $\Delta$PPL spans a broader interval, typically between $\mathbf{0.0}$ and $\mathbf{3.0}$, with 
+    most points lying in the $\mathbf{0.5\text{--}1.5}$ band. 
+    Overall, ablating five CMA-selected heads delivers meaningfully stronger debiasing than Top-K=1, 
+    but introduces non-trivial perplexity increases and greater variance.
+    \item \textbf{SFC-lite, Top-K=1}: delivers a small but consistent reduction in mediated bias while preserving model perplexity extremely well. 
+    Across runs, $\Delta|$NIE$|$ falls in the range $\mathbf{-0.20 \text{ to } -0.10}$, corresponding to 
+    Remaining NIE concentrated tightly around $\mathbf{94\%\text{--}96\%}$ (with one control point at $100\%$). 
+    The perplexity cost is very small: $\Delta$PPL is typically within $\mathbf{0.0\text{--}0.8}$, 
+    with the majority of points clustered around $\mathbf{0.3\text{--}0.6}$. 
+    Compared to head ablation at the same Top-K, SFC-lite achieves similar (slightly stronger) bias reduction 
+    but with noticeably smoother and lower-variance $\Delta$PPL, indicating a more targeted and 
+    less destructive edit.
+    \item \textbf{SFC-lite, Top-K=5}: yields substantially stronger bias reduction than the Top-K=1 case,
+    while maintaining moderate perplexity cost. 
+    Across runs, $\Delta|$NIE$|$ spans a wide and consistently negative range,
+    from $\mathbf{-1.75}$ to $\mathbf{-1.25}$, with most points clustered between $\mathbf{-1.55}$ and $\mathbf{-1.35}$.
+    This corresponds to Remaining NIE values concentrated around $\mathbf{38\%\text{--}50\%}$,
+    with a few points extending to $\sim\!55\%$, and a baseline control at $100\%$.
+    Perplexity degradation remains moderate: $\Delta$PPL falls within $\mathbf{0.3\text{--}1.8}$,
+    with the densest region in $\mathbf{0.5\text{--}1.2}$.
+    Compared to HeadOff (Top-K=5), SFC-lite achieves comparable or stronger bias removal 
+    but exhibits smoother behavior and lower variance in $\Delta$PPL.
+    This indicates that feature-level steering provides a more targeted intervention
+    than full head ablation, especially at higher K.
+    
+\end{itemize}
+
+\begin{figure}[t]
+\centering
+\begin{minipage}{0.48\linewidth}\centering
+\includegraphics[width=0.95\linewidth]{fig/nie_baselines_topk1_nie_scatter.png}\\
+\small $\Delta|\text{NIE}|$ (after -- before) vs.\ $\Delta$PPL
+\end{minipage}\hfill
+\begin{minipage}{0.48\linewidth}\centering
+\includegraphics[width=0.95\linewidth]{fig/nie_baselines_topk1_bias_pareto.png}\\
+\small Remaining bias (\%) vs.\ $\Delta$PPL
+\end{minipage}
+\caption{ZeroOut, Top-K=1. CMA-selected heads zeroed at post-attention outputs.}
+\label{fig:zeroout_k1}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\begin{minipage}{0.48\linewidth}\centering
+\includegraphics[width=0.95\linewidth]{fig/nie_baselines_topk5_nie_scatter.png}\\
+\small $\Delta|\text{NIE}|$ (after -- before) vs.\ $\Delta$PPL
+\end{minipage}\hfill
+\begin{minipage}{0.48\linewidth}\centering
+\includegraphics[width=0.95\linewidth]{fig/nie_baselines_topk5_bias_pareto.png}\\
+\small Remaining bias (\%) vs.\ $\Delta$PPL
+\end{minipage}
+\caption{ZeroOut, Top-K=5.}
+\label{fig:zeroout_k5}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\begin{minipage}{0.48\linewidth}\centering
+\includegraphics[width=0.95\linewidth]{fig/pareto_topk1_20251112_191818_nie_scatter.png}\\
+\small $\Delta|\text{NIE}|$ (after -- before) vs.\ $\Delta$PPL
+\end{minipage}\hfill
+\begin{minipage}{0.48\linewidth}\centering
+\includegraphics[width=0.95\linewidth]{fig/pareto_topk1_20251112_191818_bias_pareto.png}\\
+\small Remaining bias (\%) vs.\ $\Delta$PPL
+\end{minipage}
+\caption{SFC-lite, Top-K=1. SAE feature-level steering on attributed features.}
+\label{fig:sfclite_k1}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\begin{minipage}{0.48\linewidth}\centering
+\includegraphics[width=0.95\linewidth]{fig/pareto_topk5_20251113_165836_nie_scatter.png}\\
+\small $\Delta|\text{NIE}|$ (after -- before) vs.\ $\Delta$PPL
+\end{minipage}\hfill
+\begin{minipage}{0.48\linewidth}\centering
+\includegraphics[width=0.95\linewidth]{fig/pareto_topk5_20251113_165836_bias_pareto.png}\\
+\small Remaining bias (\%) vs.\ $\Delta$PPL
+\end{minipage}
+\caption{SFC-lite, Top-K=5.}
+\label{fig:sfclite_k5}
+\end{figure}
+
+\section{Conclusion}
+
+In this midterm report, we combined causal mediation analysis with sparse autoencoder
+feature steering to study Pareto-efficient debiasing on GPT-2 small. 
+Preliminary results show that CMA-localized heads provide a useful prior for identifying
+bias-mediating submodules, and that SFC-lite style feature-level edits can achieve 
+comparable or stronger reductions in mediated gender bias than head ablations, 
+while incurring only moderate perplexity costs, especially at higher Top-$K$. 
+In the final stage of the project, we plan to (i) run full RandomSurgery baselines,
+(ii) explore additional bias datasets and prompts, and (iii) tighten our Pareto-frontier
+estimates with robustness checks and confidence intervals.
+
+\section*{References}
+\medskip
+{\small
+\bibliography{ref}
+}
+\medskip
+
+\appendix
+
+\end{document}
